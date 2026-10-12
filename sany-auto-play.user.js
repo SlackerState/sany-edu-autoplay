@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         三一在线学院 - 自动连播
 // @namespace    https://github.com/SlackerState/sany-edu-autoplay
-// @version      1.6.0
+// @version      1.7.0
 // @description  edu.sany.com.cn（云学堂）学习项目页：视频自动播放、文档自动挂满学时并随机翻页、完成后自动切到下一个未完成项，防挂机验证时声音+通知提醒本人确认，页面右下角带控制面板。正常倍速，不跳进度，不碰考试。
 // @author       SlackerState
 // @license      MIT
@@ -231,17 +231,30 @@ doc:
     const cur = Number(pg.querySelector('input')?.value) || 0;
     const total = Number((pg.innerText.match(/\/\s*(\d+)/) || [])[1]) || 0;
     const next = pg.nextElementSibling;
-    const atEnd = !next || next.classList.contains('is-disabled') || (total > 0 && cur >= total);
-    return { cur, total, next, atEnd };
+    const prev = pg.previousElementSibling;
+    const off = el => !el || el.classList.contains('is-disabled');
+    const atEnd = off(next) || (total > 0 && cur >= total);
+    const atStart = off(prev) || cur <= 1;
+    return { cur, total, next, prev, atEnd, atStart };
   }
 
   // ======================= 文档自动翻页 =======================
+  // 先往后翻；到末页后往回翻，到首页再往后，计时结束前一直来回翻动
   let nextFlipAt = 0;
+  let flipDir = 1;          // 1 往后，-1 往前
+  let flipReachedEnd = false;
+
+  function resetFlip() {
+    nextFlipAt = 0;
+    flipDir = 1;
+    flipReachedEnd = false;
+  }
 
   function flipDelay(p, remain) {
     let lo = CFG.flipMinMs, hi = CFG.flipMaxMs;
+    // 第一遍往后翻时，页数多、时间不够就加快，尽量在计时结束前到末页
     const left = p.total ? p.total - p.cur : 0;
-    if (CFG.flipPace && remain > 0 && left > 0) {
+    if (CFG.flipPace && !flipReachedEnd && flipDir === 1 && remain > 0 && left > 0) {
       const pace = (remain * 1000) / left; // 刚好翻完需要的平均间隔
       if (pace < lo) {
         lo = Math.max(3000, pace * 0.7);
@@ -253,13 +266,23 @@ doc:
 
   function maybeFlip(remain) {
     const p = CFG.flip && docPager();
-    if (!p || p.atEnd) { nextFlipAt = 0; return; }
+    if (!p || (p.atEnd && p.atStart)) { nextFlipAt = 0; return; } // 只有一页
     const now = Date.now();
     if (!nextFlipAt) { nextFlipAt = now + flipDelay(p, remain); return; }
     if (now < nextFlipAt) return;
-    p.next.click();
-    if (p.cur + 1 === p.total) log(`已翻到最后一页（${p.total}）`);
-    nextFlipAt = now + flipDelay({ ...p, cur: p.cur + 1 }, remain);
+
+    // 到头就掉头
+    if (flipDir === 1 && p.atEnd) {
+      flipDir = -1;
+      if (!flipReachedEnd) log(`已到末页（${p.total || p.cur}），开始往回翻`);
+      flipReachedEnd = true;
+    } else if (flipDir === -1 && p.atStart) {
+      flipDir = 1;
+      log('已回到首页，开始往后翻');
+    }
+
+    (flipDir === 1 ? p.next : p.prev).click();
+    nextFlipAt = now + flipDelay({ ...p, cur: p.cur + flipDir }, remain);
   }
 
   // ======================= 动作 =======================
@@ -431,7 +454,7 @@ doc:
       if (isDocPage()) maybeFlip(remain);
       return;
     }
-    nextFlipAt = 0;
+    resetFlip();
 
     // 3. 当前项已完成（或视频已播完）：等页面自动跳转，超时则自己切
     if (!waitSince) waitSince = Date.now();
@@ -774,8 +797,11 @@ doc:
       $('pagerRow').hidden = !p;
       if (p) {
         let info = `第 ${p.cur}${p.total ? ' / ' + p.total : ''} 页`;
-        if (p.atEnd) info += ' · 已到末页';
-        else if (CFG.flip && timer && nextFlipAt) info += ` · ${Math.max(0, Math.ceil((nextFlipAt - Date.now()) / 1000))} 秒后翻页`;
+        if (CFG.flip && timer && nextFlipAt) {
+          // 显示的是下一次实际要翻的方向（到头会掉头）
+          const back = (flipDir === -1 && !p.atStart) || (flipDir === 1 && p.atEnd);
+          info += ` · ${Math.max(0, Math.ceil((nextFlipAt - Date.now()) / 1000))} 秒后${back ? '往回' : ''}翻页`;
+        }
         $('pageInfo').textContent = info;
       }
 
