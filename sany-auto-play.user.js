@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         三一在线学院 - 自动连播
 // @namespace    https://github.com/SlackerState/sany-edu-autoplay
-// @version      1.3.0
-// @description  edu.sany.com.cn（云学堂）学习项目页：视频自动播放、文档自动挂满学时、处理"继续学习"弹窗、完成后自动切到下一个未完成项，页面右下角带控制面板。正常倍速，不跳进度，不碰考试。
+// @version      1.4.0
+// @description  edu.sany.com.cn（云学堂）学习项目页：视频自动播放、文档自动挂满学时、完成后自动切到下一个未完成项，防挂机验证时声音+通知提醒本人确认，页面右下角带控制面板。正常倍速，不跳进度，不碰考试。
 // @author       SlackerState
 // @license      MIT
 // @homepageURL  https://github.com/SlackerState/sany-edu-autoplay
@@ -67,6 +67,12 @@ advanced:
     title: 完成或需要手动处理时弹出系统通知
     type: checkbox
     default: true
+afk:
+  sound:
+    title: 防挂机验证时响铃提醒
+    description: 平台弹出防挂机验证后需在 60 秒内由本人点「继续学习」，脚本不会代点
+    type: checkbox
+    default: true
  ==/UserConfig== */
 
 (function () {
@@ -81,6 +87,7 @@ advanced:
     nextWaitMs: (Number(GM_getValue('advanced.nextWaitSec', 15)) || 15) * 1000,
     stuckMs: (Number(GM_getValue('advanced.stuckSec', 60)) || 60) * 1000,
     notify: GM_getValue('advanced.notify', true),
+    afkSound: GM_getValue('afk.sound', true),
   };
 
   // 脚本会自动处理的类型；其余（考试、作业、调查、外链课等）只提示，不进入
@@ -216,14 +223,92 @@ advanced:
     return false;
   }
 
-  const OK_TEXTS = ['继续学习', '继续观看', '我知道了', '知道了', '确定', '确认', '继续'];
+  // ---------- 防挂机验证：只提醒，不代点 ----------
+  // 这个弹窗是平台确认"本人在场"的，必须由本人点击；脚本只负责让你注意到它。
+  const AFK_RE = /防挂机|挂机验证|是否还在/;
+  const DIALOG_SEL = '[class*="dialog"], [class*="message-box"], [class*="msgbox"], [class*="modal"]';
+
+  function afkDialog() {
+    const box = [...document.querySelectorAll(DIALOG_SEL)]
+      .find(b => b.offsetParent && AFK_RE.test(b.innerText));
+    if (!box) return null;
+    return { box, expired: /倒计时结束|重新学习/.test(box.innerText) };
+  }
+
+  const afk = { since: 0, expiredNotified: false, titleTimer: null, title: '' };
+
+  function onAfk(d) {
+    if (!afk.since) {
+      afk.since = Date.now();
+      afk.expiredNotified = false;
+      log('⚠️ 防挂机验证弹出，等待本人点击「继续学习」');
+      if (!d.expired) {
+        GM_notification({
+          title: '⚠️ 防挂机验证',
+          text: '请在 60 秒内回到页面，亲自点击「继续学习」，否则本次学时会被清零',
+          timeout: 60000,
+          onclick: () => window.focus(),
+        });
+        beep();
+      }
+      flashTitle(true);
+    }
+    if (d.expired && !afk.expiredNotified) {
+      afk.expiredNotified = true;
+      notify('防挂机验证已超时，本次学时被清零。请回到页面点「重新学习」');
+    } else if (!d.expired && CFG.afkSound && (Date.now() - afk.since) % 15000 < CFG.tickMs) {
+      beep(); // 每 15 秒再响一次
+    }
+  }
+
+  function onAfkGone() {
+    if (!afk.since) return;
+    log('防挂机验证已处理，继续');
+    afk.since = 0;
+    flashTitle(false);
+    waitSince = 0;
+  }
+
+  function beep() {
+    if (!CFG.afkSound) return;
+    try {
+      const ac = new (window.AudioContext || window.webkitAudioContext)();
+      [0, 0.35, 0.7].forEach(t => {
+        const o = ac.createOscillator(), g = ac.createGain();
+        o.frequency.value = 880;
+        g.gain.setValueAtTime(0.25, ac.currentTime + t);
+        g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + t + 0.25);
+        o.connect(g).connect(ac.destination);
+        o.start(ac.currentTime + t);
+        o.stop(ac.currentTime + t + 0.25);
+      });
+      setTimeout(() => ac.close(), 1500);
+    } catch { /* 浏览器不允许发声时忽略 */ }
+  }
+
+  function flashTitle(on) {
+    clearInterval(afk.titleTimer);
+    afk.titleTimer = null;
+    if (on) {
+      afk.title = document.title;
+      let flip = false;
+      afk.titleTimer = setInterval(() => {
+        flip = !flip;
+        document.title = flip ? '⚠️ 请点「继续学习」' : afk.title;
+      }, 1000);
+    } else if (afk.title) {
+      document.title = afk.title;
+    }
+  }
+
+  // ---------- 普通提示弹窗 ----------
+  const OK_TEXTS = ['我知道了', '知道了', '确定', '确认'];
   function handleDialogs() {
-    const boxes = document.querySelectorAll(
-      '[class*="dialog"], [class*="message-box"], [class*="msgbox"], [class*="modal"]'
-    );
+    const boxes = document.querySelectorAll(DIALOG_SEL);
     for (const box of boxes) {
       if (!box.offsetParent) continue;
-      if (/考试|交卷|提交/.test(box.innerText)) continue; // 不碰考试相关弹窗
+      if (AFK_RE.test(box.innerText)) continue;                 // 防挂机验证留给本人
+      if (/考试|交卷|提交|验证/.test(box.innerText)) continue;   // 不碰考试和任何验证类弹窗
       const btn = [...box.querySelectorAll('button, .yxt-button, [role="button"]')]
         .find(b => b.offsetParent && OK_TEXTS.includes(b.innerText.trim()));
       if (btn) {
@@ -237,6 +322,11 @@ advanced:
 
   // ======================= 主循环 =======================
   async function tick() {
+    // 防挂机验证期间脚本什么都不做，只提醒
+    const d = afkDialog();
+    if (d) { onAfk(d); return; }
+    onAfkGone();
+
     handleDialogs();
     if (clickStartButton()) { waitSince = 0; return; }
 
@@ -319,6 +409,8 @@ advanced:
     if (timer) log('已停止');
     clearInterval(timer);
     timer = null;
+    afk.since = 0;
+    flashTitle(false);
     refreshMenu();
     UI.render();
   }
@@ -395,6 +487,9 @@ advanced:
 
       .log { background: #FAFAFA; border-radius: 8px; padding: 6px 8px; font: 11px/1.6 ui-monospace, Menlo, monospace; color: #595959; max-height: 92px; overflow: auto; white-space: pre-wrap; word-break: break-all; }
       .warn { background: #FFFBE6; border: 1px solid #FFE58F; color: #874D00; border-radius: 8px; padding: 6px 10px; font-size: 12px; }
+      .warn.danger { background: #FFF1F0; border-color: #FFA39E; color: #A8071A; font-weight: 500; font-size: 13px; }
+      .panel.alert .hd { background: #FF4D4F; animation: blink 1s infinite; }
+      @keyframes blink { 50% { background: #CF1322; } }
     `;
 
     const HTML = `
@@ -575,11 +670,22 @@ advanced:
       }
 
       const warn = $('warn');
-      const tips = [];
-      if (CFG.rate !== 1) tips.push(`当前 ${CFG.rate}× 倍速，平台可能不计学时，建议用 1×`);
-      if (timer && isDocPage() && !v) tips.push('文档按停留时长计时，请保持此页面可见，不要最小化窗口');
-      warn.hidden = !tips.length;
-      warn.textContent = tips.join('；');
+      const d = afkDialog();
+      root.querySelector('.panel').classList.toggle('alert', !!d);
+      warn.classList.toggle('danger', !!d);
+      if (d) {
+        const left = afk.since ? Math.max(0, 60 - Math.floor((Date.now() - afk.since) / 1000)) : 60;
+        warn.hidden = false;
+        warn.textContent = d.expired
+          ? '⚠️ 防挂机验证已超时，本次学时被清零。请点页面上的「重新学习」'
+          : `⚠️ 防挂机验证：请在约 ${left} 秒内亲自点击页面上的「继续学习」`;
+      } else {
+        const tips = [];
+        if (CFG.rate !== 1) tips.push(`当前 ${CFG.rate}× 倍速，平台可能不计学时，建议用 1×`);
+        if (timer && isDocPage() && !v) tips.push('文档按停留时长计时，请保持此页面可见，不要最小化窗口');
+        warn.hidden = !tips.length;
+        warn.textContent = tips.join('；');
+      }
 
       // 大纲
       const list = $('list');
