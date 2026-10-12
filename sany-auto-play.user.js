@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         三一在线学院 - 自动连播
 // @namespace    https://github.com/SlackerState/sany-edu-autoplay
-// @version      1.4.0
+// @version      1.5.0
 // @description  edu.sany.com.cn（云学堂）学习项目页：视频自动播放、文档自动挂满学时、完成后自动切到下一个未完成项，防挂机验证时声音+通知提醒本人确认，页面右下角带控制面板。正常倍速，不跳进度，不碰考试。
 // @author       SlackerState
 // @license      MIT
@@ -245,7 +245,7 @@ afk:
       if (!d.expired) {
         GM_notification({
           title: '⚠️ 防挂机验证',
-          text: '请在 60 秒内回到页面，亲自点击「继续学习」，否则本次学时会被清零',
+          text: '请在 60 秒内回到页面，按空格/回车或点击「继续学习」，否则本次学时会被清零',
           timeout: 60000,
           onclick: () => window.focus(),
         });
@@ -260,6 +260,21 @@ afk:
       beep(); // 每 15 秒再响一次
     }
   }
+
+  // 本人按空格/回车即可确认：只响应真实键盘事件（isTrusted），脚本自己不会触发
+  document.addEventListener('keydown', e => {
+    if (!e.isTrusted || !['Space', 'Enter', 'NumpadEnter'].includes(e.code)) return;
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable) return;
+    const d = afkDialog();
+    if (!d || d.expired) return;
+    const btn = [...d.box.querySelectorAll('button')]
+      .find(b => b.offsetParent && /继续学习/.test(b.innerText));
+    if (!btn) return;
+    e.preventDefault();
+    e.stopPropagation();
+    btn.click();
+    log('已按键确认防挂机验证');
+  }, true);
 
   function onAfkGone() {
     if (!afk.since) return;
@@ -678,7 +693,7 @@ afk:
         warn.hidden = false;
         warn.textContent = d.expired
           ? '⚠️ 防挂机验证已超时，本次学时被清零。请点页面上的「重新学习」'
-          : `⚠️ 防挂机验证：请在约 ${left} 秒内亲自点击页面上的「继续学习」`;
+          : `⚠️ 防挂机验证：约 ${left} 秒内按空格/回车或点「继续学习」确认`;
       } else {
         const tips = [];
         if (CFG.rate !== 1) tips.push(`当前 ${CFG.rate}× 倍速，平台可能不计学时，建议用 1×`);
