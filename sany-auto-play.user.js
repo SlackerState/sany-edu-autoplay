@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         三一在线学院 - 自动连播
 // @namespace    https://github.com/SlackerState/sany-edu-autoplay
-// @version      1.5.0
-// @description  edu.sany.com.cn（云学堂）学习项目页：视频自动播放、文档自动挂满学时、完成后自动切到下一个未完成项，防挂机验证时声音+通知提醒本人确认，页面右下角带控制面板。正常倍速，不跳进度，不碰考试。
+// @version      1.6.0
+// @description  edu.sany.com.cn（云学堂）学习项目页：视频自动播放、文档自动挂满学时并随机翻页、完成后自动切到下一个未完成项，防挂机验证时声音+通知提醒本人确认，页面右下角带控制面板。正常倍速，不跳进度，不碰考试。
 // @author       SlackerState
 // @license      MIT
 // @homepageURL  https://github.com/SlackerState/sany-edu-autoplay
@@ -73,6 +73,31 @@ afk:
     description: 平台弹出防挂机验证后需在 60 秒内由本人点「继续学习」，脚本不会代点
     type: checkbox
     default: true
+doc:
+  flip:
+    title: 阅读文档时自动翻页
+    type: checkbox
+    default: true
+  flipMinSec:
+    title: 翻页间隔下限
+    type: number
+    default: 15
+    min: 3
+    max: 600
+    unit: 秒
+  flipMaxSec:
+    title: 翻页间隔上限
+    description: 每次在上下限之间随机取一个间隔
+    type: number
+    default: 45
+    min: 5
+    max: 900
+    unit: 秒
+  flipPace:
+    title: 按剩余时间加快翻页
+    description: 页数多、时间不够时自动缩短间隔，尽量在计时结束前翻到最后一页
+    type: checkbox
+    default: true
  ==/UserConfig== */
 
 (function () {
@@ -88,7 +113,12 @@ afk:
     stuckMs: (Number(GM_getValue('advanced.stuckSec', 60)) || 60) * 1000,
     notify: GM_getValue('advanced.notify', true),
     afkSound: GM_getValue('afk.sound', true),
+    flip: GM_getValue('doc.flip', true),
+    flipMinMs: (Number(GM_getValue('doc.flipMinSec', 15)) || 15) * 1000,
+    flipMaxMs: (Number(GM_getValue('doc.flipMaxSec', 45)) || 45) * 1000,
+    flipPace: GM_getValue('doc.flipPace', true),
   };
+  if (CFG.flipMaxMs < CFG.flipMinMs) CFG.flipMaxMs = CFG.flipMinMs;
 
   // 脚本会自动处理的类型；其余（考试、作业、调查、外链课等）只提示，不进入
   const AUTO_TYPES = ['视频', '音频', '文档', '课程', '微课'];
@@ -192,6 +222,44 @@ afk:
 
   function isDocPage() {
     return !!document.querySelector('.yxtbiz-doc-player');
+  }
+
+  // 文档底部翻页栏：[夜间][放大][缩小][全屏][上一页][页码 / 总页数][下一页]
+  function docPager() {
+    const pg = document.querySelector('.yxtbiz-doc-player .is-page');
+    if (!pg) return null;
+    const cur = Number(pg.querySelector('input')?.value) || 0;
+    const total = Number((pg.innerText.match(/\/\s*(\d+)/) || [])[1]) || 0;
+    const next = pg.nextElementSibling;
+    const atEnd = !next || next.classList.contains('is-disabled') || (total > 0 && cur >= total);
+    return { cur, total, next, atEnd };
+  }
+
+  // ======================= 文档自动翻页 =======================
+  let nextFlipAt = 0;
+
+  function flipDelay(p, remain) {
+    let lo = CFG.flipMinMs, hi = CFG.flipMaxMs;
+    const left = p.total ? p.total - p.cur : 0;
+    if (CFG.flipPace && remain > 0 && left > 0) {
+      const pace = (remain * 1000) / left; // 刚好翻完需要的平均间隔
+      if (pace < lo) {
+        lo = Math.max(3000, pace * 0.7);
+        hi = Math.max(lo + 1000, pace * 1.2);
+      }
+    }
+    return lo + Math.random() * (hi - lo);
+  }
+
+  function maybeFlip(remain) {
+    const p = CFG.flip && docPager();
+    if (!p || p.atEnd) { nextFlipAt = 0; return; }
+    const now = Date.now();
+    if (!nextFlipAt) { nextFlipAt = now + flipDelay(p, remain); return; }
+    if (now < nextFlipAt) return;
+    p.next.click();
+    if (p.cur + 1 === p.total) log(`已翻到最后一页（${p.total}）`);
+    nextFlipAt = now + flipDelay({ ...p, cur: p.cur + 1 }, remain);
   }
 
   // ======================= 动作 =======================
@@ -357,11 +425,13 @@ afk:
       return;
     }
 
-    // 2. 文档/其他按时长计的内容：倒计时还在走，就等着
+    // 2. 文档/其他按时长计的内容：倒计时还在走，就等着（文档顺便翻页）
     if (cur && !cur.done && remain > 0) {
       waitSince = 0;
+      if (isDocPage()) maybeFlip(remain);
       return;
     }
+    nextFlipAt = 0;
 
     // 3. 当前项已完成（或视频已播完）：等页面自动跳转，超时则自己切
     if (!waitSince) waitSince = Date.now();
@@ -442,6 +512,7 @@ afk:
     const CSS = `
       :host { all: initial; }
       * { box-sizing: border-box; }
+      [hidden] { display: none !important; }
       .panel {
         position: fixed; z-index: 2147483000; width: 320px;
         font: 13px/1.5 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -485,6 +556,8 @@ afk:
       select { border: 1px solid #D9D9D9; border-radius: 6px; padding: 4px 6px; background: #fff; color: #262626; }
       .vol { display: flex; align-items: center; gap: 4px; flex: 1; min-width: 0; }
       .vol input { flex: 1; min-width: 0; accent-color: #436BFF; }
+      .chk { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+      .chk input { margin: 0; accent-color: #436BFF; }
 
       .list { max-height: clamp(90px, calc(100vh - 420px), 210px); overflow: auto; border: 1px solid #F0F0F0; border-radius: 8px; }
       .list.hide { display: none; }
@@ -525,6 +598,10 @@ afk:
             <div class="row"><span class="muted" id="nowLabel">当前</span><span class="muted" id="time"></span></div>
             <div class="name" id="curName">—</div>
             <div class="bar blue"><i id="curBar"></i></div>
+            <div class="row pager" id="pagerRow" hidden>
+              <span class="muted" id="pageInfo"></span>
+              <label class="muted chk"><input type="checkbox" id="flip"> 自动翻页</label>
+            </div>
           </div>
 
           <div class="warn" id="warn" hidden></div>
@@ -586,6 +663,14 @@ afk:
       };
 
       $('vol').value = Math.round(CFG.volume * 100);
+      $('flip').checked = CFG.flip;
+      $('flip').onchange = e => {
+        CFG.flip = e.target.checked;
+        GM_setValue('doc.flip', CFG.flip);
+        nextFlipAt = 0;
+        log(CFG.flip ? '已开启文档自动翻页' : '已关闭文档自动翻页');
+      };
+
       $('vol').oninput = e => {
         CFG.volume = Number(e.target.value) / 100;
         GM_setValue('play.volume', Number(e.target.value));
@@ -682,6 +767,16 @@ afk:
         $('nowLabel').textContent = cur?.done ? '已完成' : '当前';
         $('time').textContent = '';
         $('curBar').style.width = cur?.done ? '100%' : '0%';
+      }
+
+      // 文档页码 + 下次翻页倒计时
+      const p = !v && docPager();
+      $('pagerRow').hidden = !p;
+      if (p) {
+        let info = `第 ${p.cur}${p.total ? ' / ' + p.total : ''} 页`;
+        if (p.atEnd) info += ' · 已到末页';
+        else if (CFG.flip && timer && nextFlipAt) info += ` · ${Math.max(0, Math.ceil((nextFlipAt - Date.now()) / 1000))} 秒后翻页`;
+        $('pageInfo').textContent = info;
       }
 
       const warn = $('warn');
